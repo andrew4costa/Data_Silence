@@ -1,0 +1,326 @@
+###Used libraries####
+library(readxl)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(ggpubr)
+library(car)
+library(rsample)
+library(dplyr)
+
+##importing and fixing the dataset####
+####Data importing#####
+#substitute [...] with your own directory
+rw = read.table("C:\\Users\\...\\winequality-red.csv",sep=",",header=T)
+ww = read.table("C:\\Users\\...\\winequality-white.csv",sep=";",header=T)
+
+rw['type'] <- c("red")
+ww['type'] <- c("white")
+wdb <- rbind(ww,rw)
+wdb<-as.data.frame(wdb)
+summary(wdb)
+#wdb %>% 
+# DataExplorer::create_report()
+
+
+####Data fixing####
+wdb <- wdb %>%
+  mutate(
+    quality = ifelse(quality<=5, "low", "high"),
+    quality = factor(quality)
+  ) %>%
+  mutate(across(where(is.character), as.factor))
+wdb <- wdb[!duplicated(wdb),]
+
+
+####Normalize?####
+min_max_norm <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+wdb_n <- as.data.frame(apply(wdb[,-c(12,13,14)], 2, min_max_norm))
+wdb_n <- cbind(wdb_n,wdb[,c(12,13,14)])
+wdb_n$type <- as.factor(wdb$type)
+wdb_n$qtybin <- as.factor(wdb$qtybin)
+#fac <- as.data.frame(apply(wdb_n[,c(13,14)],2,as.factor()))
+#dfnorm <- cbind(wdb_n[,-c(13,14)], fac)
+dfnorm <- wdb_n[,-12]  
+#wdb_n %>% 
+# DataExplorer::create_report()
+
+##PREPROCESSING####
+###Train/test split####
+set.seed(42)
+split <- initial_split(wdb, strata=type, prop = .8)
+splits <- initial_split(training(split), strata=type, prop= .7)
+folds<-vfold_cv(training(splits))
+qty_split <- initial_split(wdb %>% select(-quality), strata = type)
+
+#MODELLING####
+
+###Baseline recipe####  
+rcp_spec <- recipe(quality ~ ., data = training(splits))%>%
+  step_dummy(type)
+rcp_spec %>% prep() %>% juice() %>% glimpse() 
+
+###A baseline tree model ####
+treemod <- decision_tree(
+  mode = "classification",
+  engine = "rpart",
+  tree_depth = 25,
+  min_n = 5
+)
+
+wrkfl_tree <- workflow() %>%
+  add_model(treemod) %>%
+  add_recipe(rcp_spec) %>% 
+  fit(training(splits))
+
+wrkfl_tree %>% 
+  calibrate_evaluate_plot(y = "quality", type = "testing", mode = "classification")
+
+####Hyperparameter tuning#### - useless
+set.seed(42)
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(),
+  levels = 5
+)
+tree_grid
+
+set.seed(42)
+wrkfl_tree <- workflow() %>%
+  add_model(treemod) %>%
+  add_recipe(rcp_spec) 
+
+tree_res <- wrkfl_tree %>% 
+  tune_grid(
+    resamples = folds,
+    grid = tree_grid
+  )
+tree_res
+tree_res %>% collect_metrics()
+
+# We might get more out of plotting these results
+
+tree_res %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+tree_res %>% show_best("accuracy", n = 3)
+best_tree <- tree_res %>%
+  select_best("accuracy")
+best_tree
+final_wf <-	wrkfl_tree %>% 
+  finalize_workflow(best_tree)
+final_wf
+final_fit <- final_wf %>%
+  last_fit(qty_split) 
+
+final_fit %>%	collect_metrics()
+
+final_fit %>%
+  collect_predictions() %>% 
+  roc_curve(class, .pred_PS) %>% 
+  autoplot()
+
+###A pruned tree####
+
+
+###Bagging####
+
+model_spec_bag <- bag_tree(
+  mode = "classification",
+  cost_complexity = 0.01,
+  tree_depth = 10,
+  min_n = 2
+) %>%
+  set_engine("rpart",	times = 50) # 25 ensemble members
+
+set.seed(42)
+wrkfl_fit_bag <- workflow() %>%
+  add_model(model_spec_bag) %>%
+  add_recipe(rcp_spec) %>%
+  fit(training(splits))
+
+wrkfl_fit_bag %>% 
+  calibrate_evaluate_plot(y = "quality", mode = "classification", type = "testing")
+
+###Random Forest####
+model_spec_rf <- rand_forest(
+  mode = "classification",
+  mtry = 3,
+  trees = 1000,
+  min_n = 25
+) %>%
+  set_engine("ranger") # faster implementation
+
+set.seed(42)
+wrkfl_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(rcp_spec) %>%
+  fit(training(splits))
+
+wrkfl_fit_rf %>% 
+  calibrate_evaluate_plot(y = "quality", mode = "classification", type = "testing")
+
+### XGBOOST#### - non funziona
+model_spec_xgb <- boost_tree(
+  mode = "classification",
+  mtry = 3,
+  trees = 1000,
+  min_n = 2,
+  tree_depth = 12,
+  learn_rate = 0.3,
+  loss_reduction = 0
+) %>%
+  set_engine("xgboost")
+
+set.seed(42)
+wrkfl_fit_xgb <- workflow() %>%
+  add_model(model_spec_xgb) %>%
+  add_recipe(rcp_spec) %>%
+  fit(training(splits))
+
+wrkfl_fit_xgb %>%
+  extract_fit_parsnip() %>%
+  pluck("fit") %>%
+  xgboost::xgb.importance(model = .) %>%
+  xgboost::xgb.plot.importance()
+wrkfl_fit_xgb %>% 
+  calibrate_evaluate_plot(y = "quality", mode = "classification", type = "testing")
+
+###LIGHT GBM####
+model_spec_lightgbm <- boost_tree(mode = "classification") %>%
+  set_engine("lightgbm")
+set.seed(123)
+wrkfl_fit_lightgbm <- workflow() %>%
+  add_model(model_spec_lightgbm) %>%
+  add_recipe(rcp_spec) %>%
+  fit(training(splits))
+
+wrkfl_fit_lightgbm %>%
+  parsnip::extract_fit_engine() %>%
+  lightgbm::lgb.importance() %>%
+  lightgbm::lgb.plot.importance()
+
+wrkfl_fit_lightgbm %>% 
+  calibrate_evaluate_plot(y = "quality", mode = "classification", type = "testing")
+ 
+___________________________________________________________________________________________________
+#####Code from lab classes for plotting and evaluation matrics - By M. Zanotti ####
+calibrate_evaluate_plot <- function(
+  model_fit, 
+  y, 
+  mode, 
+  type = "testing", 
+  print = TRUE
+) {
+  
+  if (type == "testing") {
+    new_data <- testing(splits)
+  } else {
+    new_data <- training(splits)
+  }
+  
+  if (mode == "regression") {
+    pred_res <- model_fit %>% 
+      augment(new_data) %>%
+      dplyr::select(all_of(y), .pred) %>% 
+      set_names(c("Actual", "Pred")) %>% 
+      # bind_cols(
+      # 	model_fit %>% 
+      # 		predict(new_data, type = "conf_int") %>%
+      # 		set_names(c("Lower", "Upper")) 
+      # ) %>% 
+      add_column("Type" = type)
+  } else {
+    pred_res <- model_fit %>% 
+      augment(new_data) %>%
+      dplyr::select(all_of(y), contains(".pred")) %>% 
+      set_names(c("Actual", "Pred", "Prob_Low", "Prob_High")) %>% 
+      add_column("Type" = type)
+  }
+  
+  pred_met <- pred_res %>% evaluate_model(mode, type)
+  
+  if (mode == "regression") {
+    pred_plot <- pred_res %>% plot_model(mode)
+  } else {
+    pred_plot <- pred_met %>% plot_model(mode)
+  }
+  
+  if (print) {
+    print(pred_met)
+    print(pred_plot)	
+  }
+  
+  res <- list(
+    "pred_results" = pred_res,
+    "pred_metrics" = pred_met
+  )
+  
+  return(invisible(res))
+  
+}
+
+
+evaluate_model <- function(prediction_results, mode, type) {
+  
+  if (mode == "regression") {
+    res <- prediction_results %>% 
+      metrics(truth = Actual, estimate = Pred) %>% 
+      dplyr::select(.metric, .estimate) %>% 
+      set_names(c("Metric", "Estimate")) %>% 
+      add_column("Type" = type)
+  } else {
+    res_confmat <- prediction_results %>%
+      conf_mat(truth = Actual, estimate = Pred)
+    res_metrics <- bind_rows(
+      prediction_results %>% metrics(truth = Actual, estimate = Pred),
+      prediction_results %>% roc_auc(truth = Actual, estimate = Prob_Low)
+    ) %>% 
+      dplyr::select(.metric, .estimate) %>% 
+      set_names(c("Metric", "Estimate")) %>% 
+      add_column("Type" = type)
+    res_roc <- prediction_results %>%
+      roc_curve(truth = Actual, Prob_Low) %>% 
+      add_column("Type" = type)
+    res <- list("confusion" = res_confmat$table, "metrics" = res_metrics, "roc" = res_roc)
+  }
+  
+  return(res)
+  
+}
+
+plot_model <- function(prediction_results, mode) {
+  
+  if (mode == "regression") {
+    p <- prediction_results %>% 
+      dplyr::select(-Type) %>% 
+      mutate(id = 1:n()) %>% 
+      ggplot(aes(x = id)) +
+      geom_point(aes(y = Actual, col = "Actual")) +
+      geom_point(aes(y = Pred, col = "Pred")) +
+      # geom_errorbar(aes(ymin = Lower, ymax = Upper), width = .2, col = "red") +
+      scale_color_manual(values = c("black", "red")) +
+      labs(x = "", y = "", col = "") +
+      theme_minimal()
+  } else {
+    p <- prediction_results$roc %>%
+      ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+      geom_path() +
+      geom_abline(lty = 3) +
+      coord_equal() + 
+      theme_minimal() 
+  }
+  
+  res <- plotly::ggplotly(p)
+  return(res)
+  
+}
+
