@@ -1,0 +1,302 @@
+---
+title: "Ridge and Lasso"
+author: "Andrew Costa"
+date: "07/06/2022"
+output: 
+  html_document: default
+  word_document: default
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Exploration of Ridge and Lasso Regression: Wine dataset
+
+The wine dataset is one particulary widespread given its usability. It is an organised and clean dataset, with no missing values and mostly linear variables.
+
+The goal of this part of the project will be to firstly reduce the number of variables in the model in order to have a more comprehensible model output. The second part will be to divide the quality of wine into binary categories -- good and bad -- in order to then classify the wines.
+
+The project will be divided into the following steps:
+  1. Exploratory Data Analysis
+  2. Data Cleaning
+  3. Feature Engineering 
+      - Best subset selection
+      - Forward subset selection
+      - Backward subset selection
+  4. Model Creation
+      - Initialise Logistic Regression
+      - Ridge Regression
+      - Lasso
+  5. Model Evaluation
+
+
+## 1. Import any dependencies needed
+```{r library}
+library(readxl)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(ggpubr)
+library(car)
+library(rsample)
+library(dplyr)
+library(bestglm)
+library(dplyr)
+setwd("/Users/andrewcosta/Desktop/Milan/Statistical_Learning/Data_Silence")
+source("utils.R")
+source("packages.R")
+```
+
+## 2. Data Preprocessing
+
+```{r concat, echo=FALSE}
+getwd()
+rw = read.table("/Users/andrewcosta/Desktop/Milan/Statistical_Learning/Data_Silence/winequality-red.csv",sep=",",header=T)
+ww = read.table("/Users/andrewcosta/Desktop/Milan/Statistical_Learning/Data_Silence/archive/winequality-white.csv",sep=";",header=T)
+source("utils.R")
+
+rw['type'] <- c("red")
+ww['type'] <- c("white")
+wdb <- rbind(ww,rw)
+wdb<-as.data.frame(wdb)
+summary(wdb)
+
+####Data fixing####
+wdb <- wdb %>%
+  mutate(
+    quality = ifelse(quality<=5, "low", "high"),
+    quality = factor(quality)
+  ) %>%
+  mutate(across(where(is.character), as.factor))
+wdb <- wdb[!duplicated(wdb),]
+
+##PREPROCESSING####
+###Train/test split####
+set.seed(42)
+split <- initial_split(wdb, strata=type, prop = .8)
+splits <- initial_split(training(split), strata=type, prop= .7)
+folds <- vfold_cv(training(splits))
+qty_split <- initial_split(wdb %>% dplyr::select(-quality), strata = type)
+```
+
+
+
+## 3. Baseline Model Initiation
+
+```{r}
+# initialise baseline recipe
+###Baseline recipe####  
+rcp_spec <- recipe(quality ~ ., data = training(splits))%>%
+  step_dummy(type)
+rcp_spec %>% prep() %>% juice() %>% glimpse()
+```
+
+
+```{r}
+# initialise baseline model
+model_logistic <- glm(quality ~., data = training(splits), family = binomial)
+# view model coefficients
+coef(model_logistic)
+
+```
+
+## 3. Parameter Selection
+### Best Subset Selection
+
+```{r}
+wdb.bglm <- wdb[,c(1:12)]
+wdb.bglm <- wdb.bglm %>%
+  mutate(
+    quality = ifelse(quality=="low", 0, 1),
+    quality = factor(quality)
+  )
+wdb.bglm = rename(wdb.bglm, y=quality)
+Xy <- wdb.bglm
+
+model_best_subset_selection <- bestglm(Xy, IC = "AIC", family=binomial)
+model_best_subset_selection
+summary(model_best_subset_selection)
+
+model_best_subset_selection$Subsets
+
+```
+
+### Forward Subset Selection
+
+```{r}
+library(MASS)
+model_forward_selection <- model_logistic %>% stepAIC(trace = FALSE, direction = "forward")
+coef(model_forward_selection)
+```
+
+### Backwards Subset Selection
+
+```{r}
+model_backward_selection <- model_logistic %>% stepAIC(trace = FALSE, direction = "backward")
+coef(model_backward_selection)
+
+```
+
+
+## 4. Model Initiation: Ridge, LASSO, ElasticNet
+
+```{r}
+# ridge
+ridge_model <-  logistic_reg( #RIDGE
+  mode = "classification",
+  penalty = tune(), #to be tuned!
+  mixture = 0
+) %>%
+  set_engine("glmnet")
+
+# LASSO
+lasso_model <-  logistic_reg( #LASSO
+  mode = "classification",
+  penalty = tune(), #to be tuned!
+  mixture = 1
+) %>%
+  set_engine("glmnet")
+
+# MIXED
+elastic_net_model <-  logistic_reg( #ELASTIC NET (w/ mixture of norms to be tuned)
+  mode = "classification",
+  penalty = tune(), #to be tuned!
+  mixture = tune() #to be tuned!
+) %>%
+  set_engine("glmnet")
+
+####* Workflows ----------------------------------------------------------------
+workflow_ridge <- workflow() %>% #RIDGE
+  add_model(ridge_model) %>%
+  add_recipe(rcp_spec)
+
+workflow_lasso <- workflow() %>% #LASSO
+  add_model(lasso_model) %>%
+  add_recipe(rcp_spec)
+
+workflow_elastic_net <- workflow() %>% #ELASTIC NET
+  add_model(elastic_net_model) %>%
+  add_recipe(rcp_spec)
+```
+
+## 5. Grid Search
+
+```{r}
+# Grid for only the penalty (to be used for lasso and ridge).
+set.seed(42)
+model_grid_penalty <- grid_regular( 
+  penalty(),
+  levels = 10
+)
+model_grid_penalty
+model_grid_penalty %>% map(unique)
+
+# Grid for both the penalty and the mixture (to be used for elastic net). Creates 
+model_grid_penalty_mixture <- grid_regular(
+  penalty(),
+  mixture(),
+  levels = 10
+)
+
+model_grid_penalty_mixture
+model_grid_penalty_mixture %>% map(unique)
+```
+
+
+## 6. Tuning Parameters
+
+```{r}
+####* Tuning -------------------------------------------------------------------
+set.seed(42)
+# Tuning of the hyperparameter (penalty) for the Ridge
+model_result_ridge <- workflow_ridge %>% 
+  tune_grid(
+    resamples = folds,
+    grid = model_grid_penalty
+  )
+
+# Tuning of the hyperparameter (penalty) for the Lasso
+model_result_lasso <- workflow_lasso %>% 
+  tune_grid(
+    resamples = folds,
+    grid = model_grid_penalty
+  )
+
+# Tuning of the hyperparameters (penalty and mixture) for the Elastic Net
+model_result_elastic_net <- workflow_elastic_net %>% 
+  tune_grid(
+    resamples = folds,
+    grid = model_grid_penalty_mixture
+  )
+
+```
+
+
+## 7. Model Evaluation
+
+```{r}
+####* Evaluation  --------------------------------------------------------------
+# Select the best values of the hyperparameter choosing the value that minimizes
+# the accuracy
+model_result_ridge %>% collect_metrics()
+model_ridge_best <- model_result_ridge %>% select_best("accuracy")
+model_ridge_best
+```
+
+```{r}
+model_result_lasso %>% collect_metrics()
+model_lasso_best <- model_result_lasso %>% select_best("accuracy")
+model_lasso_best
+```
+
+```{r}
+model_result_elastic_net %>% collect_metrics()
+model_elastic_net_best <- model_result_elastic_net %>% select_best("accuracy")
+model_elastic_net_best
+```
+
+
+```{r}
+####* Re-fitting  --------------------------------------------------------------
+# Refit the models on the entire training set using the best value of the hyperparameters.
+# Test the performance of this model on the test set.
+workflow_ridge_final <-	workflow_ridge %>%	
+  finalize_workflow(model_ridge_best) %>% 
+  last_fit(splits) 
+
+workflow_lasso_final <-	workflow_lasso %>%	
+  finalize_workflow(model_lasso_best) %>% 
+  last_fit(splits)
+
+workflow_elastic_net_final <-	workflow_elastic_net %>%	
+  finalize_workflow(model_elastic_net_best) %>% 
+  last_fit(splits)
+
+
+
+```
+
+
+### Ridge Results
+
+```{r}
+workflow_ridge_final %>%	collect_metrics()
+workflow_ridge_final %>% collect_predictions()
+```
+
+### LASSO Results
+
+```{r}
+workflow_lasso_final %>%	collect_metrics()
+workflow_lasso_final %>% collect_predictions()
+```
+
+### Elastic Net Results
+
+```{r}
+workflow_elastic_net_final %>%	collect_metrics()
+workflow_elastic_net_final %>% collect_predictions()
+```
+
